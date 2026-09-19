@@ -145,7 +145,9 @@ class DByzSGDM(BaseOptimizer):
         self.reference_shapes: Optional[List[torch.Size]] = None
 
         # Server-side per-client momentum cache: m_i
-        # Indexed by client_id; each is a flat (d,)-shaped tensor stored on CPU.
+        # Indexed by client_id; each is a flat (d,)-shaped tensor. Runtime
+        # buffers stay on the compute device and are moved to CPU only when a
+        # checkpoint is written.
         # This cache is the heart of the "delayed momentum" idea: non-selected
         # clients contribute their cached m_i instead of computing a fresh one.
         self._momentum_cache: List[Optional[torch.Tensor]] = []
@@ -179,8 +181,7 @@ class DByzSGDM(BaseOptimizer):
     def _lazy_init(self, sample_grad: List[torch.Tensor]) -> None:
         """Initialise dimensions on the first gradient computation."""
         self.reference_shapes = [g.shape for g in sample_grad]
-        flat = self._flatten(sample_grad)
-        self.d = flat.numel()
+        self.d = sum(g.numel() for g in sample_grad)
         print(
             f"[D-Byz-SGDM] Initialised: d={self.d}, participation p={self.participation}, "
             f"momentum alpha={self.momentum}, lr={self.lr}, weight_decay={self.weight_decay}"
@@ -227,6 +228,7 @@ class DByzSGDM(BaseOptimizer):
                 bool(torch.rand(1).item() < self.participation) for _ in range(n)
             ]
         context.extra["d_byz_sgdm_participants"] = mask
+        context.extra["active_client_mask"] = mask
 
     # ------------------------------------------------------------------
     # Hook 2 — AFTER_COMPUTE: client-side momentum update (participants only)
@@ -361,6 +363,12 @@ class DByzSGDM(BaseOptimizer):
                 context.grad[hid] = hmom
             self._pending_momentum.clear()
 
+        # It is possible that nobody participates on the first Bernoulli
+        # draw. Initialise vector metadata from the model so cached zero
+        # momentum remains well-defined without forcing a client backward.
+        if self.d is None:
+            self._lazy_init([p.detach() for p in context.server.model.parameters()])
+
         for i in range(len(context.grad)):
             g = context.grad[i]
 
@@ -385,6 +393,10 @@ class DByzSGDM(BaseOptimizer):
                     device = self._infer_device(context)
                     m_cached = m_cached.to(device)
 
+                # Cache the device-resident value as well. This avoids both
+                # recreating initial zeros and repeatedly uploading restored
+                # CPU checkpoint buffers while a client remains inactive.
+                self._momentum_cache[i] = m_cached
                 context.grad[i] = [m_cached]
             else:
                 # Entry is populated.  Ensure it is in [flat (d,)-tensor] format.
@@ -407,7 +419,13 @@ class DByzSGDM(BaseOptimizer):
         store these back into the cache so that the *next* step's
         non-participants reuse the most recent value.
         """
+        mask = context.extra.get("d_byz_sgdm_participants")
         for i in range(len(context.grad)):
+            # A non-participant's cache is already the required delayed
+            # momentum. Avoid cloning it (and previously copying it from GPU
+            # to CPU) on every single step.
+            if mask is not None and not mask[i]:
+                continue
             g = context.grad[i]
             if g is None:
                 continue
@@ -417,7 +435,7 @@ class DByzSGDM(BaseOptimizer):
                 m_i = g[0]
             else:
                 m_i = self._flatten(g)
-            self._momentum_cache[i] = m_i.cpu().clone()
+            self._momentum_cache[i] = m_i.detach()
 
     # ------------------------------------------------------------------
     # Server-side model update

@@ -9,12 +9,26 @@ from .base_aggregator import BaseAggregator
 
 class CompressAggregator(BaseAggregator):
     # 修改一：在__init__中添加 byzantine_alpha 参数
-    def __init__(self, m: int, r: int, k: int, krum_remain: float, byzantine_alpha: float): # 添加 k 和 byzantine_alpha 参数
+    def __init__(
+        self,
+        m: int,
+        r: int,
+        k: int,
+        krum_remain: float,
+        byzantine_alpha: float,
+        clip_enabled: bool = True,
+    ): # 添加 k 和 byzantine_alpha 参数
         self.m = m
         self.r = r
         self.k = k # K: 每次迭代中保留的行数 (用于FABA后的Top-K选择)
         self.krum_remain = krum_remain
         self.byzantine_alpha = byzantine_alpha # α: 假设的拜占庭工作者比例 (用于 FABA)
+        # Backward-compatible switch used by the isolated AdamK EF ablation.
+        # Historical configs omit it and retain the original ARC clipping.
+        self.clip_enabled = bool(clip_enabled)
+        # Runtime-only exact Top-K row mask. Mask-aware optimizers read this
+        # after aggregation instead of guessing the mask from gradient values.
+        self.last_selected_rows = None
         self.d = None  # Total flattened gradient dimension (for a single client)
         self.n = None  # Number of columns for G_i matrix: d / m
         self.V = None  # Random projection matrix V (shape n x r)
@@ -177,6 +191,7 @@ class CompressAggregator(BaseAggregator):
         _, topk_indices_It = torch.topk(sigma_t, self.k) # topk_indices_It 形状为 (k,)
         # 确保索引是有序的，虽然不是严格要求，但有助于后续处理和调试
         topk_indices_It = topk_indices_It.sort().values
+        self.last_selected_rows = topk_indices_It.detach()
 
 
         # ======================================================================
@@ -216,7 +231,7 @@ class CompressAggregator(BaseAggregator):
         clipped_honest_grads = []
         
         # 仅当有梯度需要处理时才执行裁剪
-        if all_collected_sparse_flat_grads:
+        if self.clip_enabled and all_collected_sparse_flat_grads:
             # 步骤 1: 计算所有 n 个梯度的 L2 范数
             all_norms = [torch.norm(g, p=2) for g in all_collected_sparse_flat_grads]
             # 步骤 2: 根据范数大小对梯度进行降序排序 (我们只需要排序后的范数)
@@ -271,6 +286,7 @@ class CompressAggregator(BaseAggregator):
             'r': self.r,
             'k': self.k,
             'byzantine_alpha': self.byzantine_alpha, # 新增 byzantine_alpha
+            'clip_enabled': self.clip_enabled,
             'd': self.d,
             'n': self.n,
             'V': self.V,
@@ -290,6 +306,7 @@ class CompressAggregator(BaseAggregator):
         self.r = state.get('r', self.r)
         self.k = state.get('k', self.k)
         self.byzantine_alpha = state.get('byzantine_alpha', self.byzantine_alpha) # 新增 byzantine_alpha
+        self.clip_enabled = state.get('clip_enabled', self.clip_enabled)
         self.d = state.get('d')
         self.n = state.get('n')
         self.V = state.get('V')
@@ -299,4 +316,3 @@ class CompressAggregator(BaseAggregator):
             print(f"CompressAggregator 状态已加载: d={self.d}, n={self.n}, r={self.r}, k={self.k}, byzantine_alpha={self.byzantine_alpha}, V 形状={self.V.shape}")
         else:
             print("警告: 状态部分加载，某些关键属性可能仍为 None。")
-

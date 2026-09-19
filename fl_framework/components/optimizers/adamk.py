@@ -87,6 +87,26 @@ class ADAMK(BaseOptimizer):
             self._m = [g.clone().detach() for g in aggregated_grad]
             self._v = [(g*g).clone().detach() for g in aggregated_grad]
         else:
+            if len(self._m) != len(aggregated_grad) or len(self._v) != len(aggregated_grad):
+                raise RuntimeError(
+                    "ADAMK checkpoint state does not match the aggregated gradient structure."
+                )
+
+            # Checkpoint tensors are deliberately serialized on CPU in
+            # ``get_state``.  Move them lazily to the runtime device/dtype on
+            # the first update after resume.  Subsequent steps keep the same
+            # tensor objects and incur no transfer.
+            self._m = [
+                m.to(device=g.device, dtype=g.dtype)
+                if m.device != g.device or m.dtype != g.dtype else m
+                for m, g in zip(self._m, aggregated_grad)
+            ]
+            self._v = [
+                v.to(device=g.device, dtype=g.dtype)
+                if v.device != g.device or v.dtype != g.dtype else v
+                for v, g in zip(self._v, aggregated_grad)
+            ]
+
             torch._foreach_mul_(self._m, self.beta1)
             torch._foreach_add_(self._m, aggregated_grad, alpha=(1 - self.beta1))
 

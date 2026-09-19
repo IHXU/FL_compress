@@ -41,7 +41,25 @@ class FOE(BaseAttack):
         Returns:
             List[torch.Tensor]: The list of malicious gradients for each layer, after sign flipping and scaling.
         """
-        ref_grad = context.all_honest_gradients[0]
+        # Under partial-participation optimizers (e.g. DByzSGDM with
+        # participation < 1), honest clients that are not selected this step
+        # have grad=None. Filter them out so the mean is computed over the
+        # honest clients that actually produced a raw gradient.
+        honest_grads = [g for g in context.all_honest_gradients if g is not None]
+
+        if not honest_grads:
+            # No honest client participated this step. Reuse the last cached
+            # mean gradient as a delayed reference (consistent with the
+            # delayed-momentum design of DByzSGDM); on the very first step
+            # fall back to a zero vector of the correct shape.
+            if not self.mean_grad:
+                return [
+                    torch.zeros_like(p) * self.mu
+                    for p in context.server.model.parameters()
+                ]
+            return [g * self.mu for g in self.mean_grad]
+
+        ref_grad = honest_grads[0]
         if self.current_step != context.current_step:
             self.current_step = context.current_step
             self.mean_grad = []
@@ -51,7 +69,7 @@ class FOE(BaseAttack):
             # Iterate through each layer/tensor position
             for i in range(num_layers):
                 # Collect the i-th gradient tensor from all clients
-                layer_gradients = [client_grad[i] for client_grad in context.all_honest_gradients]
+                layer_gradients = [client_grad[i] for client_grad in honest_grads]
 
                 # Store original shape and device for reconstruction
                 original_shape = layer_gradients[0].shape

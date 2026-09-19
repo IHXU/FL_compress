@@ -45,7 +45,17 @@ class FedDPRoC(BaseOptimizer):
         gradient is 2 * C * sigma_NM.  Set to 0 to disable noise.  Default 0.01.
     seed : int
         Random seed for reproducible Count-Sketch hash generation.  Default 42.
+    share_client_models : bool
+        Share one model per device across sequential clients. This is safe for
+        stateless normalization such as GroupNorm; BatchNorm is rejected.
     """
+
+    # FedDPRoC never updates client-local model parameters. Clients only run
+    # forward/backward passes and immediately clone their gradients, so clients
+    # assigned to the same device can safely share one model instance. The
+    # Server treats this as an opt-in capability; all other optimizers retain
+    # the existing independent-model behaviour.
+    share_client_models = True
 
     def __init__(
         self,
@@ -56,6 +66,7 @@ class FedDPRoC(BaseOptimizer):
         clip_threshold: float = 10.0,
         noise_multiplier: float = 0.01,
         seed: int = 42,
+        share_client_models: bool = True,
     ) -> None:
         super().__init__(lr=lr)
         self.alpha = alpha
@@ -64,6 +75,7 @@ class FedDPRoC(BaseOptimizer):
         self.clip_threshold = clip_threshold
         self.noise_multiplier = noise_multiplier
         self.seed = seed
+        self.share_client_models = share_client_models
 
         # --- Lazy-initialised state (set on first gradient) ---
         self.d: Optional[int] = None           # total gradient dimension
@@ -74,6 +86,11 @@ class FedDPRoC(BaseOptimizer):
         # Count-Sketch hash tables (stored on CPU to save GPU memory)
         self.hash_indices: Optional[List[torch.Tensor]] = None
         self.signs: Optional[List[torch.Tensor]] = None
+
+        # Device copies are runtime-only. Keeping them here avoids copying the
+        # full Count-Sketch tables from CPU for every block of every client on
+        # every step. CPU copies remain the checkpoint source of truth.
+        self._device_hash_tables = {}
 
         # Per-client momentum buffers: momentum_buffers[client_id] is a flat
         # (d,)-shaped tensor on the client's device, or None if not yet created.
@@ -87,6 +104,17 @@ class FedDPRoC(BaseOptimizer):
         super().register_hooks()
         hook_registry.register(HookType.AFTER_COMPUTE, self._client_process)
         hook_registry.register(HookType.BEFORE_AGGREGATE, self._compress_all)
+
+    @staticmethod
+    def validate_shared_client_model(model) -> None:
+        """Reject models whose training-time buffers make sharing unsafe."""
+        batch_norm = torch.nn.modules.batchnorm._BatchNorm
+        if any(isinstance(module, batch_norm) for module in model.modules()):
+            raise ValueError(
+                "FedDPRoC shared client models do not support BatchNorm. "
+                "BatchNorm updates running statistics during each client's "
+                "forward pass; use GroupNorm or disable model sharing."
+            )
 
     # ------------------------------------------------------------------
     # Lazy initialisation
@@ -120,6 +148,7 @@ class FedDPRoC(BaseOptimizer):
         cpu_gen = torch.Generator(device="cpu").manual_seed(self.seed)
         self.hash_indices = []
         self.signs = []
+        self._device_hash_tables.clear()
         for _ in range(self.p):
             idx = torch.randint(
                 0, self.s, (self.d,), generator=cpu_gen, dtype=torch.long
@@ -133,6 +162,29 @@ class FedDPRoC(BaseOptimizer):
             )
             self.hash_indices.append(idx)   # stays on CPU
             self.signs.append(sign)          # stays on CPU
+
+    def _get_hash_tables(self, device: torch.device):
+        """Return persistent Count-Sketch tables on ``device``.
+
+        The hash tables never change during a run, so transferring them once
+        produces the same projection while removing repeated host-to-device
+        traffic from the hot path.
+        """
+        if self.hash_indices is None or self.signs is None:
+            raise RuntimeError("Count-Sketch tables have not been initialised")
+
+        device = torch.device(device)
+        key = str(device)
+        tables = self._device_hash_tables.get(key)
+        if tables is None:
+            indices = [
+                table.to(device, non_blocking=True)
+                for table in self.hash_indices
+            ]
+            signs = [table.to(device, non_blocking=True) for table in self.signs]
+            tables = (indices, signs)
+            self._device_hash_tables[key] = tables
+        return tables
 
     # ------------------------------------------------------------------
     # Gradient flatten / unflatten
@@ -168,10 +220,11 @@ class FedDPRoC(BaseOptimizer):
         device = vec.device
         result = torch.zeros(self.k, device=device, dtype=vec.dtype)
 
+        device_indices, device_signs = self._get_hash_tables(device)
+
         for b in range(self.p):
-            # Move one block's tables to GPU on demand.
-            idx = self.hash_indices[b].to(device, non_blocking=True)
-            sign = self.signs[b].to(device, non_blocking=True)
+            idx = device_indices[b]
+            sign = device_signs[b]
 
             # Bucket accumulation:  out[j] = Σ_{l: h(l)=j} sign(l) * vec[l]
             block_out = torch.zeros(self.s, device=device, dtype=vec.dtype)
@@ -194,9 +247,11 @@ class FedDPRoC(BaseOptimizer):
         device = compressed.device
         result = torch.zeros(self.d, device=device, dtype=compressed.dtype)
 
+        device_indices, device_signs = self._get_hash_tables(device)
+
         for b in range(self.p):
-            idx = self.hash_indices[b].to(device, non_blocking=True)
-            sign = self.signs[b].to(device, non_blocking=True)
+            idx = device_indices[b]
+            sign = device_signs[b]
 
             start = b * self.s
             block_vals = compressed[start : start + self.s]
@@ -393,6 +448,7 @@ class FedDPRoC(BaseOptimizer):
         self.reference_shapes = state.get("reference_shapes")
         self.hash_indices = state.get("hash_indices")
         self.signs = state.get("signs")
+        self._device_hash_tables.clear()
 
         raw_bufs = state.get("momentum_buffers")
         if raw_bufs is not None:

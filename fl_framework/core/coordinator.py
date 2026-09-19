@@ -30,6 +30,16 @@ def client_task(clients, context) -> Any:
         context.current_client_id = c.client_id
 
         hook_registry.trigger(HookType.BEFORE_COMPUTE, context)
+
+        # Optimizers with partial client participation can publish a boolean
+        # mask for the current step.  Skipped clients still receive the
+        # AFTER_COMPUTE hook so an optimizer can substitute cached state, but
+        # we avoid the expensive forward/backward pass entirely.
+        active_mask = context.extra.get("active_client_mask")
+        if active_mask is not None and not active_mask[c.client_id]:
+            context.grad[c.client_id] = None
+            hook_registry.trigger(HookType.AFTER_COMPUTE, context)
+            continue
         
         raw_grad = c.compute_gradients(context)
         # print(raw_grad)
@@ -114,18 +124,23 @@ class Coordinator:
         start_time = time.time()
 
         if resume_from:
+            # Initialise optimizer-owned runtime structures before restoring
+            # their checkpointed values.
+            hook_registry.trigger(HookType.BEFORE_RUN, self.context)
             self.resume(resume_from)
-            start_round = self.context.current_round
+            # Checkpoints are written after a round completes, so continue
+            # with the following round rather than repeating the saved one.
+            start_round = self.context.current_round + 1
         else:
             start_round = 0
             hook_registry.trigger(HookType.BEFORE_RUN, self.context)
 
-        loss, metrics = self.server.test()
-        self.history['loss'].append(loss)
-        self.history['metrics'].append(metrics)
-        logging.info(f"[Coordinator] Round {0} Loss: {loss}")
-        for k, v in metrics.items():
-            logging.info(f"[Coordinator] Round {0} Metric {k}: {v}")
+            loss, metrics = self.server.test()
+            self.history['loss'].append(loss)
+            self.history['metrics'].append(metrics)
+            logging.info(f"[Coordinator] Round {0} Loss: {loss}")
+            for k, v in metrics.items():
+                logging.info(f"[Coordinator] Round {0} Metric {k}: {v}")
 
         for rr in range(start_round, self.num_rounds):
             self.context.current_round = rr
@@ -176,6 +191,14 @@ class Coordinator:
         self.context.grad = [None for _ in self.clients]
 
         hook_registry.trigger(HookType.BEFORE_STEP_SERVER, self.context)
+
+        # A partial-participation optimizer may leave inactive clients with a
+        # stale local model. Synchronise only clients that will compute now;
+        # this replaces an all-client copy after every preceding update.
+        active_mask = self.context.extra.get("active_client_mask")
+        if active_mask is not None:
+            self.server.distribute_model(client_mask=active_mask)
+
         client_trigger(self.clients, self.context, HookType.BEFORE_STEP_CLIENT)
 
         if self.num_byzantine > 0:
@@ -200,7 +223,8 @@ class Coordinator:
             self.optimizer.step(self.server, aggregated_grad)
             hook_registry.trigger(HookType.AFTER_UPDATE, self.context)
 
-            self.server.distribute_model()
+            if active_mask is None:
+                self.server.distribute_model()
 
             # for sp, cp in zip(self.server.model.parameters(), self.clients[0].model.parameters()):
             #     print((sp == cp).all())
@@ -234,5 +258,9 @@ class Coordinator:
         state = torch.load(filepath)
         self.context.current_round = state["current_round"]
         self.server.set_state(state["server_state"])
+        # Independent client models must receive the restored server weights;
+        # shared models are already references and this is a cheap no-op on the
+        # primary device.
+        self.server.distribute_model()
         self.history = state['history']
         logging.info(f"[Coordinator] State loaded from {filepath}")

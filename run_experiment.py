@@ -126,12 +126,8 @@ def main():
         save_path=save_path
     )
 
-    if args.resume:
-        logging.info(f"Resuming from checkpoint: {args.resume}")
-        coordinator.resume(args.resume)
-
     logging.info("Starting the training process...")
-    coordinator.run()
+    coordinator.run(resume_from=args.resume)
     logging.info("Experiment finished successfully.")
 if __name__ == "__main__":
     main()

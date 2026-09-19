@@ -1,0 +1,59 @@
+experiment:
+  name: cifar10_byz_sgdm_broadcast_krum_withoutatt
+  seed: 42
+  log_level: INFO
+  save_path: ./results/results_main_omniscient_krum/cifar10_byz_sgdm_broadcast_krum_withoutatt
+resources:
+  gpus:
+  - 0
+dataset:
+  batch_size: 16
+  train:
+    class_path: fl_framework.data.datasets.CIFAR10Dataset
+    params:
+      data_dir: data_cache
+      train: true
+  test:
+    class_path: fl_framework.data.datasets.CIFAR10Dataset
+    params:
+      data_dir: data_cache
+      train: false
+  partition:
+    iid: true
+    seed: 42
+model:
+  class_path: fl_framework.components.models.resnet_18_for_10.ResNet18For10
+  params:
+    in_channels: 3
+training:
+  rounds: 100
+  round_steps: 300
+  train_loss_function:
+    class_path: torch.nn.CrossEntropyLoss
+  test_loss_function:
+    class_path: torch.nn.CrossEntropyLoss
+  metrics:
+  - class_path: fl_framework.utils.metrics.TopKAccuracy
+    params:
+      k: 1
+optimizer:
+  class_path: fl_framework.components.optimizers.byz_sgdm_broadcast.ByzSGDMBroadcast
+  params:
+    lr: 0.01
+    momentum: 0.9
+    beta: 0.1
+    compression_ratio: 0.1
+    weight_decay: 0.0
+aggregator:
+  class_path: fl_framework.components.aggregators.omniscient_krum.OmniscientKrumAggregator
+  params:
+    num_byzantine: 0
+    attack_scale: 1.0
+    attack_enabled: false
+honest:
+  num_clients: 20
+byzantine:
+  num_clients: 0
+  attack:
+    class_path: fl_framework.components.attacks.passthrough.PassthroughAttack
+    params: {}

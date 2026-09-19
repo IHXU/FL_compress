@@ -1,0 +1,50 @@
+experiment:
+  name: cifar10_new_adamk_ef21_signflipping_noniid_alpha01
+  seed: 42
+  log_level: INFO
+  save_path: ./results/results_adamk_ef_variants_noniid/cifar10_new_adamk_ef21_signflipping_noniid_alpha01
+resources:
+  gpus: [0]
+dataset:
+  batch_size: 16
+  train:
+    class_path: fl_framework.data.datasets.CIFAR10Dataset
+    params: {data_dir: data_cache, train: true}
+  test:
+    class_path: fl_framework.data.datasets.CIFAR10Dataset
+    params: {data_dir: data_cache, train: false}
+  partition: {iid: false, alpha: 0.1, seed: 42}
+model:
+  class_path: fl_framework.components.models.resnet_18_for_10.ResNet18For10
+  params: {in_channels: 3}
+training:
+  rounds: 100
+  round_steps: 300
+  train_loss_function:
+    class_path: torch.nn.CrossEntropyLoss
+  test_loss_function:
+    class_path: torch.nn.CrossEntropyLoss
+  metrics:
+    - class_path: fl_framework.utils.metrics.TopKAccuracy
+      params: {k: 1}
+optimizer:
+  class_path: fl_framework.components.optimizers.rp_ef21_adam.RPEF21Adam
+  params: {lr: 1.0e-4, beta1: 0.9, beta2: 0.999, eps: 1.0e-8, c_max: 10.0, client_momentum: 0.99}
+aggregator:
+  class_path: fl_framework.components.aggregators.rp_ef21.ProjectedEF21Aggregator
+  params:
+    m: 4691
+    r: 16
+    k_top: 307
+    k_random: 154
+    num_byzantine: 4
+    byzantine_bound: 4
+    correction_selection_size: 8
+    tracker_selection_size: 8
+    seed: 42
+honest: {num_clients: 16}
+byzantine:
+  num_clients: 4
+  attack:
+    class_path: fl_framework.components.attacks.sign_flipping.SignFlipping
+    params: {}

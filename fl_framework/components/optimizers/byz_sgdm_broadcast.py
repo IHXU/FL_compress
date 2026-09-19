@@ -163,8 +163,7 @@ class ByzSGDMBroadcast(BaseOptimizer):
     def _lazy_init(self, sample_grad: List[torch.Tensor], device: torch.device) -> None:
         """Initialise dimensions and buffers on the first gradient computation."""
         self.reference_shapes = [g.shape for g in sample_grad]
-        flat = self._flatten(sample_grad)
-        self.d = flat.numel()
+        self.d = sum(g.numel() for g in sample_grad)
         self.k = max(1, math.ceil(self.compression_ratio * self.d))
 
         delta = self.d / self.k - 1  # rand-k variance parameter
@@ -293,8 +292,10 @@ class ByzSGDMBroadcast(BaseOptimizer):
         c_hat = self._randk_compress(u, self.k)
 
         # 5. Update local auxiliary vector: h_omega^{t+1} = h_omega^t + beta * c_hat_omega^t
-        h_buf_new = h_buf + self.beta * c_hat
-        self._h_buffers[client_id] = h_buf_new.cpu()
+        # Keep runtime state on the compute device. Moving every client's
+        # full d-vector to CPU and back each step overwhelms PCIe bandwidth.
+        h_buf.add_(c_hat, alpha=self.beta)
+        self._h_buffers[client_id] = h_buf
 
         return c_hat
 
@@ -416,10 +417,9 @@ class ByzSGDMBroadcast(BaseOptimizer):
 
             # Update server-side auxiliary vector: h_omega^{t+1} = h_omega^t + beta * c_hat_omega^t
             if server_h is None:
-                server_h_new = self.beta * c_i
-            else:
-                server_h_new = server_h + self.beta * c_i
-            self._server_h_buffers[i] = server_h_new.cpu()
+                server_h = torch.zeros_like(c_i)
+            server_h.add_(c_i, alpha=self.beta)
+            self._server_h_buffers[i] = server_h
 
             # Replace with the reconstructed g_hat_omega^t
             context.grad[i] = [g_hat]

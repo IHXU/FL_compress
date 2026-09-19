@@ -66,6 +66,7 @@ class Server:
         self.clients: List[Client] = []
         self.test_dataloader = test_dataloader
         self.other_state = {}
+        self._share_client_models = False
 
     def register_clients(self, clients: List[Client]):
         """
@@ -75,24 +76,62 @@ class Server:
             clients (List[Client]): The clients to be managed by the server.
         """
         self.clients = clients
+        share_client_models = bool(
+            getattr(self.optimizer, "share_client_models", False)
+        )
+        if share_client_models:
+            validator = getattr(
+                self.optimizer, "validate_shared_client_model", None
+            )
+            if validator is not None:
+                validator(self.model)
+        self._share_client_models = share_client_models
+
         for i, client in enumerate(self.clients):
-                assigned_device = self.devices[i % len(self.devices)]
-                client.device = assigned_device
+            assigned_device = self.devices[i % len(self.devices)]
+            client.device = assigned_device
+            if share_client_models:
+                client.model = self.models_on_devices[assigned_device]
+            else:
                 client.model = deepcopy(self.models_on_devices[assigned_device])
-                client.loss_fn = deepcopy(self.train_loss_fn)
-        logging.info(f"[Server] Registered {len(self.clients)} clients.")
+            client.loss_fn = deepcopy(self.train_loss_fn)
+        model_mode = "shared per device" if share_client_models else "independent"
+        logging.info(
+            f"[Server] Registered {len(self.clients)} clients "
+            f"({model_mode} models)."
+        )
 
 
     @torch.no_grad()
-    def distribute_model(self):
+    def distribute_model(self, client_mask=None):
         """
         Distributes the current global model to all devices.
         This method ensures that the model is available on all specified devices.
 
-        The client model is actually a reference to the server's model, 
-        so all models on clinets are also updated.
+        For optimizers that explicitly support shared client models, clients
+        reference the per-device server model and only secondary devices need
+        synchronization. Other optimizers retain independent client models.
         """
         state_dict = self.model.state_dict()
+
+        if client_mask is not None:
+            if self._share_client_models:
+                raise ValueError(
+                    "Selective model distribution is incompatible with shared client models."
+                )
+            for client in self.clients:
+                if client_mask[client.client_id]:
+                    client.model.load_state_dict(state_dict)
+            return
+
+        if self._share_client_models:
+            # Clients already reference these per-device models. The primary
+            # model has just been updated in-place, so only secondary devices
+            # require one synchronization each.
+            for model in self.models_on_devices.values():
+                if model is not self.model:
+                    model.load_state_dict(state_dict)
+            return
 
         for device in self.devices:
             self.models_on_devices[device].load_state_dict(state_dict)

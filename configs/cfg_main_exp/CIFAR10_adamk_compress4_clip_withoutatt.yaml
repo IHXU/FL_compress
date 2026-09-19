@@ -50,9 +50,9 @@ aggregator:
   params:
     m: 4691
     r: 4
-    k: 750
+    k: 461
     krum_remain: 0.05
-    byzantine_alpha: 0.2
+    byzantine_alpha: 0.0
 honest:
   num_clients: 20
 byzantine:

@@ -1,0 +1,44 @@
+experiment:
+  name: cifar10_adamk_v5_ef_tuned_nowd_omniscient_foe_noniid_alpha01
+  seed: 42
+  log_level: INFO
+  save_path: ./results/results_adamk_ef_variants_noniid/cifar10_adamk_v5_ef_tuned_nowd_omniscient_foe_noniid_alpha01
+resources: {gpus: [0]}
+dataset:
+  batch_size: 16
+  train:
+    class_path: fl_framework.data.datasets.CIFAR10Dataset
+    params: {data_dir: data_cache, train: true}
+  test:
+    class_path: fl_framework.data.datasets.CIFAR10Dataset
+    params: {data_dir: data_cache, train: false}
+  partition: {iid: false, alpha: 0.1, seed: 42}
+model:
+  class_path: fl_framework.components.models.resnet_18_for_10.ResNet18For10
+  params: {in_channels: 3}
+training:
+  rounds: 100
+  round_steps: 300
+  train_loss_function: {class_path: torch.nn.CrossEntropyLoss}
+  test_loss_function: {class_path: torch.nn.CrossEntropyLoss}
+  metrics:
+    - class_path: fl_framework.utils.metrics.TopKAccuracy
+      params: {k: 1}
+optimizer:
+  class_path: fl_framework.components.optimizers.adamk.ADAMK
+  params:
+    lr: 1.0e-4
+    beta1: 0.7
+    beta2: 0.99
+    weight_decay: 0.0
+    lr_decay_rate: 0.5
+    lr_decay_milestone: [90]
+aggregator:
+  class_path: fl_framework.components.aggregators.compress4_clip_ef2.OmniscientEF2CompressAggregator
+  params: {m: 4691, r: 4, k: 461, krum_remain: 0.05, byzantine_alpha: 0.2, attack_scale: 10.0, attack_enabled: true}
+honest: {num_clients: 16}
+byzantine:
+  num_clients: 4
+  attack:
+    class_path: fl_framework.components.attacks.passthrough.PassthroughAttack
+    params: {}
